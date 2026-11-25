@@ -1,0 +1,161 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function currentUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function isTeacher() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        currentUserDoc().data.role == 'teacher';
+    }
+
+    // ---------------------------------------------------------
+    // 1. Users Collection (users/{uid})
+    // - Never allow storing passwordHash in Firestore
+    // - Students can read profiles (for Leaderboard/Share directory),
+    //   create/update only their own document, and cannot escalate role
+    // - Teachers can read, reset, and clear student documents
+    // ---------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isSignedIn() || resource.data.role == 'student';
+
+      allow create: if isOwner(uid)
+        && !('passwordHash' in request.resource.data)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.role in ['student', 'teacher'];
+
+      allow update: if !('passwordHash' in request.resource.data) && (
+        (
+          isOwner(uid)
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.role == resource.data.role
+        )
+        || (
+          isTeacher()
+          && resource.data.role == 'student'
+          && request.resource.data.role == 'student'
+        )
+      );
+
+      allow delete: if isTeacher() && resource.data.role == 'student';
+    }
+
+    // ---------------------------------------------------------
+    // 2. Cloud Shorts (shorts/{shortId}) + Subcollection comments
+    // - Public/Students can read Shorts & comments
+    // - Only Teachers can create, edit metadata, or delete Shorts
+    // - Signed-in users can update atomic social counters ONLY
+    //   (views, likes, likedBy, shares, commentCount)
+    // ---------------------------------------------------------
+    match /shorts/{shortId} {
+      allow read: if true;
+
+      allow create, delete: if isTeacher();
+
+      allow update: if isTeacher()
+        || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['views'])
+        || (
+          isSignedIn() &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['views', 'likes', 'likedBy', 'shares', 'commentCount', 'updatedAt'])
+        );
+
+      match /comments/{commentId} {
+        allow read: if true;
+
+        allow create: if isSignedIn()
+          && request.resource.data.authorUid == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 300;
+
+        allow update: if false;
+
+        allow delete: if isTeacher()
+          || (isSignedIn() && resource.data.authorUid == request.auth.uid);
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 3. Cross-Device Teacher Quests (quests/{questId})
+    // ---------------------------------------------------------
+    match /quests/{questId} {
+      allow read: if true;
+      allow create, update, delete: if isTeacher();
+    }
+
+    // ---------------------------------------------------------
+    // 4. Cross-Device In-App Share Inbox (shared_inbox/{msgId})
+    // ---------------------------------------------------------
+    match /shared_inbox/{msgId} {
+      allow read: if isSignedIn() && (
+        resource.data.toUid == request.auth.uid
+        || resource.data.fromUid == request.auth.uid
+        || isTeacher()
+      );
+
+      allow create: if isSignedIn()
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.toUid is string
+        && request.resource.data.toUid.size() > 0
+        && request.resource.data.shortId is string;
+
+      allow update: if false;
+
+      allow delete: if isSignedIn() && (
+        resource.data.toUid == request.auth.uid
+        || resource.data.fromUid == request.auth.uid
+        || isTeacher()
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 5. Real-Time Kahoot Live Battle Rooms (kahoot_rooms/{pin})
+    // ---------------------------------------------------------
+    match /kahoot_rooms/{pin} {
+      allow read: if true;
+
+      allow create: if isSignedIn()
+        && request.resource.data.hostUid == request.auth.uid;
+
+      allow update: if isSignedIn() && (
+        resource.data.hostUid == request.auth.uid
+        || isTeacher()
+        || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playerCount', 'updatedAt'])
+      );
+
+      allow delete: if isSignedIn() && (
+        resource.data.hostUid == request.auth.uid
+        || isTeacher()
+      );
+
+      match /players/{playerId} {
+        allow read: if true;
+
+        allow create, update: if isSignedIn() && (
+          request.auth.uid == playerId
+          || request.resource.data.uid == request.auth.uid
+          || get(/databases/$(database)/documents/kahoot_rooms/$(pin)).data.hostUid == request.auth.uid
+          || isTeacher()
+        );
+
+        allow delete: if isSignedIn() && (
+          request.auth.uid == playerId
+          || get(/databases/$(database)/documents/kahoot_rooms/$(pin)).data.hostUid == request.auth.uid
+          || isTeacher()
+        );
+      }
+    }
+  }
+}
